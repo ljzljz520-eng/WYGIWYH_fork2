@@ -7,3 +7,4 @@ class RulesConfig(AppConfig):
 
     def ready(self):
         import apps.rules.signals
+        import apps.rules.jobs  # noqa: F401

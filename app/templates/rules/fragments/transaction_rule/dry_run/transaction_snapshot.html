@@ -1,0 +1,37 @@
+{% load i18n %}
+<table class="table table-sm m-0">
+  <tbody>
+    <tr>
+      <th scope="row">{% translate 'Date' %}</th>
+      <td>{{ snap.date }}</td>
+    </tr>
+    <tr>
+      <th scope="row">{% translate 'Amount' %}</th>
+      <td>{{ snap.amount }}</td>
+    </tr>
+    <tr>
+      <th scope="row">{% translate 'Account' %}</th>
+      <td>{{ snap.account.1 }}</td>
+    </tr>
+    <tr>
+      <th scope="row">{% translate 'Category' %}</th>
+      <td>{% if snap.category.1 %}{{ snap.category.1 }}{% endif %}</td>
+    </tr>
+    <tr>
+      <th scope="row">{% translate 'Description' %}</th>
+      <td>{{ snap.description }}</td>
+    </tr>
+    <tr>
+      <th scope="row">{% translate 'Tags' %}</th>
+      <td>
+        {% for tag in snap.tags %}{{ tag.1 }}{% if not forloop.last %}, {% endif %}{% endfor %}
+      </td>
+    </tr>
+    <tr>
+      <th scope="row">{% translate 'Entities' %}</th>
+      <td>
+        {% for entity in snap.entities %}{{ entity.1 }}{% if not forloop.last %}, {% endif %}{% endfor %}
+      </td>
+    </tr>
+  </tbody>
+</table>

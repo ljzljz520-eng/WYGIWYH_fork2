@@ -1,4 +1,5 @@
 from django.conf import settings
+from django.db import transaction as db_transaction
 from django.dispatch import receiver
 
 from apps.transactions.models import (
@@ -7,25 +8,55 @@ from apps.transactions.models import (
     transaction_updated,
     transaction_deleted,
 )
-from apps.rules.tasks import check_for_transaction_rules
+from apps.rules.jobs import process_transaction_event
 from apps.common.middleware.thread_local import get_current_user
 from apps.rules.utils.transactions import serialize_transaction
+
+
+def _enqueue(
+    *,
+    event,
+    transaction_ref,
+    transaction_version,
+    user_id,
+    transaction_data=None,
+    is_hard_deleted=False,
+):
+    payload = {
+        "event": event,
+        "transaction_ref": transaction_ref,
+        "transaction_version": transaction_version,
+        "user_id": user_id,
+        "transaction_data": transaction_data,
+        "is_hard_deleted": is_hard_deleted,
+    }
+    # Runs immediately when there is no active transaction; otherwise after
+    # the outer transaction commits (and never if it rolls back).
+    db_transaction.on_commit(
+        lambda: process_transaction_event.defer(**payload)
+    )
 
 
 @receiver(transaction_created)
 @receiver(transaction_updated)
 @receiver(transaction_deleted)
 def transaction_changed_receiver(sender: Transaction, signal, **kwargs):
-    old_data = kwargs.get("old_data")
+    current_user = get_current_user()
+    user_id = current_user.id if current_user else None
+
     if signal is transaction_deleted:
         # Serialize transaction data for processing
         transaction_data = serialize_transaction(sender, deleted=True)
 
-        check_for_transaction_rules.defer(
+        _enqueue(
+            event="deleted",
+            transaction_ref=sender.id,
+            transaction_version=sender.version,
+            user_id=user_id,
             transaction_data=transaction_data,
-            user_id=get_current_user().id,
-            signal="transaction_deleted",
-            is_hard_deleted=kwargs.get("hard_delete", not settings.ENABLE_SOFT_DELETE),
+            is_hard_deleted=kwargs.get(
+                "hard_delete", not settings.ENABLE_SOFT_DELETE
+            ),
         )
         return
 
@@ -36,16 +67,13 @@ def transaction_changed_receiver(sender: Transaction, signal, **kwargs):
         dca_entry.amount_received = sender.amount
         dca_entry.save()
 
-    if signal is transaction_updated and old_data:
-        old_data = serialize_transaction(old_data, deleted=False)
-
-    check_for_transaction_rules.defer(
-        instance_id=sender.id,
-        user_id=get_current_user().id,
-        signal=(
-            "transaction_created"
+    _enqueue(
+        event=(
+            "created"
             if signal is transaction_created
-            else "transaction_updated"
+            else "updated"
         ),
-        old_data=old_data,
+        transaction_ref=sender.id,
+        transaction_version=sender.version,
+        user_id=user_id,
     )

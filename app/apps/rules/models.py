@@ -1,11 +1,17 @@
+from django.conf import settings
 from django.db import models
 from django.db.models import Q
 from django.utils.translation import gettext_lazy as _
 
+from apps.common.functions.versions import bump_version
 from apps.common.models import SharedObject, SharedObjectManager
 
 
 class TransactionRule(SharedObject):
+    class ExecutionMode(models.TextChoices):
+        ATOMIC = "atomic", _("Atomic")
+        ISOLATED = "isolated", _("Rule-level isolation")
+
     active = models.BooleanField(default=True)
     on_update = models.BooleanField(default=False)
     on_create = models.BooleanField(default=True)
@@ -18,6 +24,17 @@ class TransactionRule(SharedObject):
         default=False,
     )
     order = models.PositiveIntegerField(default=0, verbose_name=_("Order"))
+    execution_mode = models.CharField(
+        max_length=20,
+        choices=ExecutionMode.choices,
+        default=ExecutionMode.ATOMIC,
+        verbose_name=_("Execution mode"),
+        help_text=_(
+            "Atomic rolls back every action if one fails. "
+            "Rule-level isolation commits each action independently."
+        ),
+    )
+    version = models.PositiveIntegerField(default=1, verbose_name=_("Version"))
 
     objects = SharedObjectManager()
     all_objects = models.Manager()  # Unfiltered manager
@@ -25,6 +42,10 @@ class TransactionRule(SharedObject):
     class Meta:
         verbose_name = _("Transaction rule")
         verbose_name_plural = _("Transaction rules")
+
+    def save(self, *args, **kwargs):
+        bump_version(self, kwargs)
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return self.name
@@ -441,3 +462,161 @@ class UpdateOrCreateTransactionRuleAction(models.Model):
                     search_query &= Q(entities__name__iexact=entities_value)
 
         return search_query
+
+
+class RuleExecution(models.Model):
+    """A single application (or rejection) of one rule version to one event version.
+
+    Uniquely identified by the transaction event, the transaction version and
+    the rule version. ``transaction_ref``/``rule_ref`` are stable integer
+    identifiers so history survives deletion of the referenced objects.
+    """
+
+    class Event(models.TextChoices):
+        CREATED = "created", _("Transaction created")
+        UPDATED = "updated", _("Transaction updated")
+        DELETED = "deleted", _("Transaction deleted")
+
+    class Status(models.TextChoices):
+        PENDING = "pending", _("Pending")
+        COMPLETED = "completed", _("Completed")
+        FAILED = "failed", _("Failed")
+        STALE = "stale", _("Stale")
+        SKIPPED = "skipped", _("Skipped")
+
+    transaction_ref = models.BigIntegerField(verbose_name=_("Transaction ID"))
+    rule_ref = models.BigIntegerField(verbose_name=_("Rule ID"))
+
+    transaction = models.ForeignKey(
+        "transactions.Transaction",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="rule_executions",
+        verbose_name=_("Transaction"),
+    )
+    rule = models.ForeignKey(
+        TransactionRule,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="rule_executions",
+        verbose_name=_("Rule"),
+    )
+
+    event = models.CharField(
+        max_length=20, choices=Event.choices, verbose_name=_("Event")
+    )
+    transaction_version = models.PositiveBigIntegerField(
+        verbose_name=_("Transaction version")
+    )
+    rule_version = models.PositiveBigIntegerField(verbose_name=_("Rule version"))
+
+    status = models.CharField(
+        max_length=20, choices=Status.choices, default=Status.PENDING
+    )
+    # Failure detail / stale reason, e.g. {"reason": ..., "failed_action": ..., "error": ...}
+    detail = models.JSONField(default=dict, blank=True)
+    # Effect fingerprints produced at execution time
+    summary = models.JSONField(default=dict, blank=True)
+
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="rule_executions",
+        verbose_name=_("Created by"),
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = _("Rule execution")
+        verbose_name_plural = _("Rule executions")
+        ordering = ["-id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=[
+                    "transaction_ref",
+                    "event",
+                    "transaction_version",
+                    "rule_ref",
+                    "rule_version",
+                ],
+                name="rule_execution_unique_key",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["status"]),
+            models.Index(fields=["transaction_ref", "event"]),
+        ]
+
+    def __str__(self):
+        return (
+            f"RuleExecution tx={self.transaction_ref}v{self.transaction_version} "
+            f"rule={self.rule_ref}v{self.rule_version} {self.event} [{self.status}]"
+        )
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in {
+            self.Status.COMPLETED,
+            self.Status.FAILED,
+            self.Status.STALE,
+            self.Status.SKIPPED,
+        }
+
+
+class RuleActionExecution(models.Model):
+    """Idempotent result and provenance for one action within a RuleExecution."""
+
+    class Status(models.TextChoices):
+        APPLIED = "applied", _("Applied")
+        FAILED = "failed", _("Failed")
+        SKIPPED = "skipped", _("Skipped")
+        ROLLED_BACK = "rolled_back", _("Rolled back")
+
+    class ActionType(models.TextChoices):
+        EDIT = "edit_transaction", _("Edit transaction")
+        UPDATE_OR_CREATE = (
+            "update_or_create_transaction",
+            _("Update or create transaction"),
+        )
+
+    class EffectKind(models.TextChoices):
+        MODIFY = "modify", _("Modify")
+        CREATE = "create", _("Create")
+        REJECT = "reject", _("Reject")
+
+    rule_execution = models.ForeignKey(
+        RuleExecution,
+        on_delete=models.CASCADE,
+        related_name="action_executions",
+        verbose_name=_("Rule execution"),
+    )
+    action_type = models.CharField(
+        max_length=40, choices=ActionType.choices, verbose_name=_("Action type")
+    )
+    action_ref = models.BigIntegerField(verbose_name=_("Action ID"))
+    order = models.PositiveIntegerField(default=0, verbose_name=_("Order"))
+    status = models.CharField(
+        max_length=20, choices=Status.choices, verbose_name=_("Status")
+    )
+    error = models.TextField(blank=True, default="", verbose_name=_("Error"))
+    # List of {"kind": modify|create|reject, "target_ref": ..., "old": ..., "new": ...}
+    effects = models.JSONField(default=list, blank=True, verbose_name=_("Effects"))
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = _("Rule action execution")
+        verbose_name_plural = _("Rule action executions")
+        ordering = ["order", "id"]
+
+    def __str__(self):
+        return (
+            f"{self.action_type}#{self.action_ref} order={self.order} "
+            f"[{self.status}]"
+        )

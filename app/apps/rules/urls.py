@@ -58,6 +58,11 @@ urlpatterns = [
         name="transaction_rule_dry_run_updated",
     ),
     path(
+        "rules/transaction/<int:pk>/commit/",
+        views.commit_rule_execution,
+        name="transaction_rule_commit",
+    ),
+    path(
         "rules/transaction/<int:pk>/share/",
         views.transaction_rule_share,
         name="transaction_rule_share_settings",
